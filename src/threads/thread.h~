@@ -5,6 +5,7 @@
 #include <list.h>
 #include <stdint.h>
 #include "threads/synch.h"
+#include <hash.h>
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -98,26 +99,33 @@ struct thread
     /* Owned by userprog/process.c. */
     uint32_t *pagedir;                  /* Page directory. */
 
-    /* Variables to implement process hierarchy. */
-    struct thread *parent_process;	/* Parent process of thread. */
-    struct list child_process;		/* Child processes of thread. */
-    struct list_elem childelem;		/* List element for child process list. */
+    /* Connect parent process and child process. */
+    struct thread *parent_process;
+    struct list child_process;
+    struct list_elem childelem;
 
-    /* Variables for syncronization. */
-    bool is_load;			/* Whether the process load success. */
-    bool is_exit;			/* Whether the process is exited. */
-    struct semaphore exit;		/* Semaphore for wait(). */
-    struct semaphore load;		/* Semaphore for exec(). */
-    int exit_status;			/* Record the process's exit status. */
+    /* Flag for check status. */
+    bool is_load;
+    bool is_exit;
+    /* Control process flow. */
+    struct semaphore exit;
+    struct semaphore load;
+    /* Mark exit status. */
+    int exit_status;
 
-    /* Variables for file descripter table. */
-    struct file **fdt;			/* File descriptor table. */
-    int next_fd;			/*  */
+    /* File Descriptor Table. */
+    struct file **fdt;
 
+    /* Next position for save file into file descriptor table. */
+    int next_fd;
 #endif
 
     /* Owned by thread.c. */
     unsigned magic;                     /* Detects stack overflow. */
+
+    struct hash vm;			/* Hash table about virtual address. */
+    struct list mmap_list;		/* List of mapped file. */
+    int mapid;				/* MAPID. */
   };
 
 /* If false (default), use round-robin scheduler.

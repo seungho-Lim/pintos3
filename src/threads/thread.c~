@@ -205,23 +205,27 @@ thread_create (const char *name, int priority,
   sf->ebp = 0;
 
   intr_set_level (old_level);
-  
-  /* Init member of threads.
-     Save the parent process of this thread. */
-  t->parent_process = thread_current();
+
+  /* At child process's perspective, current process is parent process. */
+  t->parent_process = thread_current ();
+
+  /* Initialize semaphore and flag. */
   t->is_load = false;
   t->is_exit = false;
-  sema_init(&t->exit, 0);
-  sema_init(&t->load, 0);
-  list_push_back(&thread_current()->child_process, &t->childelem);
+  sema_init (&t->exit, 0);
+  sema_init (&t->load, 0);
 
-  /* Allocate file descriptor table and initialize it.
-     The NEXT_FD is 2, because of STDIN,STDOUT. */
+  /* Push child process to child process list. */
+  list_push_back (&thread_current ()->child_process, &t->childelem);
+
+  /* Initialize file descriptor table. 0 is STDIN, 1 is STDOUT. */
   int i;
-  t->fdt=palloc_get_page(0);
-  t->next_fd=2;
-  for(i=0;i<64;i++)
-    t->fdt[i]=NULL;
+  t->fdt = palloc_get_page(0);
+  t->next_fd = 2;
+  for (i = 0; i < 64; i++)
+    t->fdt[i] = NULL;
+
+  t->mapid = 1;
   /* Add to run queue. */
   thread_unblock (t);
 
@@ -315,10 +319,11 @@ thread_exit (void)
      when it calls thread_schedule_tail(). */
   intr_disable ();
   list_remove (&thread_current()->allelem);
-  /* Say this thread is exit to set IS_EXIT true.
-     And do sema_up(), to finish the parent's process_wait(). */
+
+  /* Change exit flag and continue parent process from process_wait */
   thread_current ()->is_exit = true;
   sema_up (&thread_current ()->exit);
+
   thread_current ()->status = THREAD_DYING;
   schedule ();
   NOT_REACHED ();
@@ -491,8 +496,9 @@ init_thread (struct thread *t, const char *name, int priority)
   t->magic = THREAD_MAGIC;
   list_push_back (&all_list, &t->allelem);
 
-  /* Init the CHILD_PROCESS of given thread. */
+  /* Initialize child process list. */
   list_init (&t->child_process);
+  list_init (&t->mmap_list);
 }
 
 /* Allocates a SIZE-byte frame at the top of thread T's stack and
@@ -564,6 +570,7 @@ thread_schedule_tail (struct thread *prev)
   if (prev != NULL && prev->status == THREAD_DYING && prev != initial_thread) 
     {
       ASSERT (prev != cur);
+      /* Disable free at schedule. Process descriptor will free by wait. */
       //palloc_free_page (prev);
     }
 }

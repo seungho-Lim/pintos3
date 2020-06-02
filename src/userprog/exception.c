@@ -1,4 +1,5 @@
 #include "userprog/exception.h"
+#include "userprog/process.h"
 #include <inttypes.h>
 #include <stdio.h>
 #include "userprog/gdt.h"
@@ -10,6 +11,7 @@ static long long page_fault_cnt;
 
 static void kill (struct intr_frame *);
 static void page_fault (struct intr_frame *);
+bool verify_stack(void *sp,void *esp);
 
 /* Registers handlers for interrupts that can be caused by user
    programs.
@@ -126,6 +128,7 @@ page_fault (struct intr_frame *f)
   bool write;        /* True: access was write, false: access was read. */
   bool user;         /* True: access by user, false: access by kernel. */
   void *fault_addr;  /* Fault address. */
+  bool load;
 
   /* Obtain faulting address, the virtual address that was
      accessed to cause the fault.  It may point to code or to
@@ -148,16 +151,30 @@ page_fault (struct intr_frame *f)
   write = (f->error_code & PF_W) != 0;
   user = (f->error_code & PF_U) != 0;
   
-  exit(-1);
+  /* Check fault occur address is valid. */
+  check_address (fault_addr, f->esp);
+  
+  /* If the access is read only page, exit. */
+  if (not_present == false)
+    exit(-1);
 
-  /* To implement virtual memory, delete the rest of the function
-     body, and replace it with code that brings in the page to
-     which fault_addr refers. */
-  printf ("Page fault at %p: %s error %s page in %s context.\n",
-          fault_addr,
-          not_present ? "not present" : "rights violation",
-          write ? "writing" : "reading",
-          user ? "user" : "kernel");
-  kill (f);
+  struct vm_entry *vme;
+  vme = find_vme (fault_addr);
+
+  /* If there is VME, call handle_mm_fault() to load physical
+     page. Or not, check the esp address is near(32Bytes) to
+     FAULT_ADDR and call expand_stack(). */
+  if (vme)
+    load = handle_mm_fault (vme);
+  else
+    {
+      if(fault_addr >= f->esp - 32)
+        {
+          load = expand_stack(fault_addr);
+        }
+    }
+
+  /* If load is fail exit. */
+  if (load == false)
+    exit (-1);
 }
-

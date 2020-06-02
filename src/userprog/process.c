@@ -19,6 +19,9 @@
 #include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "threads/synch.h"
+#include "vm/page.h"
+#include "vm/frame.h"
+#include "vm/swap.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
@@ -41,22 +44,19 @@ process_execute (const char *file_name)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
 
-  /* To parsing FILE_NAME, copy it to NAME_SIZE and parse
-     the string using strtok_r(). I'll get only first
-     element of string. */
+  /* Parse file name and Give it to thread_create (). */
   int name_size;
-  name_size = strlen(file_name) + 1;
+  name_size = strlen (file_name) + 1;
 
   char file_name_copy[name_size];
   strlcpy (file_name_copy, file_name, name_size);
 
   char *save_ptr;
   char *thread_name;
-  thread_name = strtok_r(file_name_copy, " ", &save_ptr);
+  thread_name = strtok_r (file_name_copy, " ", &save_ptr);
 
-  /* Create a new thread to execute FILE_NAME.
-     The FN_COPY is argument of start_process(). */
-  tid = thread_create(thread_name, PRI_DEFAULT, start_process, fn_copy);
+  /* Create a new thread to execute FILE_NAME. */
+  tid = thread_create (thread_name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
   return tid;
@@ -78,42 +78,51 @@ start_process (void *file_name_)
   int count;
   int i;
 
-  /* Different with process_execute(), parse all elment of string.
-     The PARSE will save each token. If some task fail,
-     free the allocated variable and call thread_exit(). */
+  /* Allocate page for fn_copy. strtok_r() modify page information, so we use copy of it.
+     If fails, free page and exit thread. */
   fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
-    {
-      palloc_free_page (file_name);
-      thread_exit ();
-    }
+  {
+    palloc_free_page (file_name);
+    thread_exit ();
+  }
   strlcpy (fn_copy, file_name, PGSIZE);
 
   count = 0;
+  /* Allocate page for storing parsed fn_copy.
+     If fails, free page and exit thread. */
   parse = palloc_get_page(0);
   if (parse == NULL)
-    {
-      palloc_free_page (file_name);
-      palloc_free_page(fn_copy);
-      thread_exit ();
-    }
+  {
+    palloc_free_page (file_name);
+    palloc_free_page (fn_copy);
+    thread_exit ();
+  }
+
+  /* Tokenize fn_copy. If page allocation error occur,
+     free all allocated page, and exit thread. */
   for (token = strtok_r (fn_copy, " ", &save_ptr) ; token != NULL ;
         token = strtok_r (NULL, " ", &save_ptr))
+  {
+    parse[count] = palloc_get_page (0);
+
+    /* Check if page allocation error occur. */
+    if (parse[count] == NULL)
     {
-      parse[count] = palloc_get_page (0);
-      if (parse[count] == NULL)
-        {
-          int j;
-          for(j=0;j<count;j++)
-            palloc_free_page(parse[j]);
-          palloc_free_page(parse);
-          palloc_free_page(fn_copy);
-          palloc_free_page (file_name);
-          thread_exit ();
-        }
-      strlcpy (parse[count], token, PGSIZE);
-      count++;
+      int j;
+      for (j = 0; j < count; j++)
+        palloc_free_page (parse[j]);
+      palloc_free_page (parse);
+      palloc_free_page (fn_copy);
+      palloc_free_page (file_name);
+      thread_exit ();
     }
+    /* Save tokenized fn_copy into parse. */
+    strlcpy (parse[count], token, PGSIZE);
+    count++;
+  }
+  /* Init hash table using vm_init(). */
+  vm_init (&thread_current ()->vm);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -122,33 +131,31 @@ start_process (void *file_name_)
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (parse[0], &if_.eip, &if_.esp);
 
-  /* SUCCESS has the information of load is fail or success.
-     So, put it in IS_LOAD with member of thread structure.
-     And say to exec() the load is finished using seam_up(). */
+  /* If load end, continue parent process.
+     Change load flag here, because immediate sema_up after load can cause ordering error. */
   thread_current()->is_load = success;
   sema_up(&thread_current()->load);
 
-  /* Save token to user stack using argument_stakc(). */
-  if(success)
-    argument_stack(parse, count, &if_.esp);
+  /* If load success, put tokenized file into stack pointer. */
+  if (success)
+    argument_stack (parse, count, &if_.esp);
 
   /* If load failed, quit. */
   palloc_free_page (file_name);
   if (!success)
-    {
-      for(i = 0 ; i < count ; i++)
-        palloc_free_page(parse[i]);
-      palloc_free_page(parse);
-      palloc_free_page(fn_copy);
-      thread_exit ();
-    }
-  //hex_dump(if_.esp, if_.esp, PHYS_BASE - if_.esp, true); // For Debug
+  {
+    for(i = 0 ; i < count ; i++)
+      palloc_free_page (parse[i]);
+    palloc_free_page (parse);
+    palloc_free_page (fn_copy);
+    thread_exit ();
+  }
 
-  /* Free remain pages. */
-  for(i = 0 ; i < count ; i++)
-    palloc_free_page(parse[i]);
-  palloc_free_page(parse);
-  palloc_free_page(fn_copy);
+  /* Always do free allocated page at the end of function . */
+  for (i = 0 ; i < count ; i++)
+    palloc_free_page (parse[i]);
+  palloc_free_page (parse);
+  palloc_free_page (fn_copy);
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -174,17 +181,22 @@ process_wait (tid_t child_tid UNUSED)
 {
   struct thread *cp;
   int status;
-  /* Find the pointer of given process and wait the process is finish,
-     using sema_down(). The share resource is EXIT semaphore. */
-  cp = get_child_process(child_tid);
-  /* If find the pointer of process is fail, return -1. */
-  if(cp == NULL)
+
+  /* Get child process using child's tid. */
+  cp = get_child_process (child_tid);
+
+  /* If fail, return abnormal result(-1) . */
+  if (cp == NULL)
     return -1;
-  sema_down(&cp->exit);
-  /* Store the EXIT_STATUS of child. */
+
+  /* Waits until child process end. */
+  sema_down (&cp->exit);
+
+  /* Check if child process end normally. */
   status = cp->exit_status;
-  /* Remove the child to CHILD_PROCESS array. */
-  remove_child_process(cp);
+
+  /* Remove finished child process. */
+  remove_child_process (cp);
   return status;
 }
 
@@ -194,13 +206,21 @@ process_exit (void)
 {
   struct thread *cur = thread_current ();
   uint32_t *pd;
-  /* Close all of the opened file. */
+
+  /* Close all file in process by using next file descriptor position.
+     And free file descriptor table. */
   int i;
   for (i = 2; i < cur->next_fd; i++){
       process_close_file (i);
   }
-  /* Deallocate the FDT, file descriptor table. */
-  palloc_free_page(cur->fdt);
+  palloc_free_page (cur->fdt);
+
+  /* Close all mapped file. */
+  munmap (CLOSE_ALL);
+
+  /* Destroy hash table and vm_entrys. */
+  vm_destroy (&cur->vm);
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -323,23 +343,26 @@ load (const char *file_name, void (**eip) (void), void **esp)
   if (t->pagedir == NULL) 
     goto done;
   process_activate ();
-  /* Get lock to other process can't access the file.
-     Before every return release lock. */
+
+  /* Acquire Lock to avoid multiple access. */
   lock_acquire (&filesys_lock);
+
   /* Open executable file. */
   file = filesys_open (file_name);
   if (file == NULL) 
-    {
-      lock_release (&filesys_lock);
-      printf ("load: %s: open failed\n", file_name);
-      goto done; 
-    }
-  /* Don't allow the file is edited during load. */
+  {
+    /* release lock before end. */
+    lock_release (&filesys_lock);
+    printf ("load: %s: open failed\n", file_name);
+    goto done; 
+  }
+  /* Deny write to avoid file change. */
   file_deny_write (file);
+
+  /* After file open done, release lock. */
   lock_release (&filesys_lock);
+
   /* Read and verify executable header. */
-
-
   if (file_read (file, &ehdr, sizeof ehdr) != sizeof ehdr
       || memcmp (ehdr.e_ident, "\177ELF\1\1\1", 7)
       || ehdr.e_type != 2
@@ -506,29 +529,30 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
       size_t page_read_bytes = read_bytes < PGSIZE ? read_bytes : PGSIZE;
       size_t page_zero_bytes = PGSIZE - page_read_bytes;
 
-      /* Get a page of memory. */
-      uint8_t *kpage = palloc_get_page (PAL_USER);
-      if (kpage == NULL)
+      /* Allocate vm_entry VME and fill it's members.
+         Then insert it to hash table. */
+      struct vm_entry *vme;
+      vme = malloc (sizeof(struct vm_entry));
+      if (vme == NULL)
         return false;
-
-      /* Load this page. */
-      if (file_read (file, kpage, page_read_bytes) != (int) page_read_bytes)
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
-      memset (kpage + page_read_bytes, 0, page_zero_bytes);
-
-      /* Add the page to the process's address space. */
-      if (!install_page (upage, kpage, writable)) 
-        {
-          palloc_free_page (kpage);
-          return false; 
-        }
+      /* If we use given file pointer FILE, It occur
+         pointer don't keep file information.
+         So use file_reopen() to keep information. */
+      vme->file = file_reopen(file);
+      vme->vaddr = upage;
+      vme->offset = ofs;
+      vme->read_bytes = page_read_bytes;
+      vme->zero_bytes = page_zero_bytes;
+      vme->writable = writable;
+      vme->is_loaded = false;
+      vme->type = VM_BIN;
+      vme->pinned = false;
+      insert_vme (&thread_current ()->vm, vme);
 
       /* Advance. */
       read_bytes -= page_read_bytes;
       zero_bytes -= page_zero_bytes;
+      ofs += page_read_bytes;
       upage += PGSIZE;
     }
   return true;
@@ -539,19 +563,35 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 static bool
 setup_stack (void **esp) 
 {
-  uint8_t *kpage;
+  struct page *kpage;
   bool success = false;
-
-  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
-  if (kpage != NULL) 
+  /* Allocate page using alloc_page(). */
+  kpage = alloc_page (PAL_USER | PAL_ZERO);
+  if (kpage->kaddr != NULL) 
     {
-      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage->kaddr, true);
       if (success)
         *esp = PHYS_BASE;
       else
-        palloc_free_page (kpage);
+        free_page (kpage->kaddr);
     }
-  return success;
+  /* Allocate vm_entry VME and fill it's members.
+     Then insert it to hash table. */
+  struct vm_entry *vme;
+  vme = malloc (sizeof(struct vm_entry));
+  if (vme == NULL)
+    {
+      free_page (kpage->kaddr);
+      return false;
+    }
+  vme->writable = true;
+  vme->vaddr = pg_round_down(((uint8_t *) PHYS_BASE) - PGSIZE);
+  vme->is_loaded = true;
+  vme->type = VM_ANON;
+  vme->pinned = true;
+  kpage->vme = vme;
+  success = insert_vme (&thread_current ()->vm, vme);
+  return true;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -574,6 +614,7 @@ install_page (void *upage, void *kpage, bool writable)
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
 }
 
+/* Save user stack into kernel stack. */
 void
 argument_stack(char **parse, int count, void **esp)
 {
@@ -582,122 +623,233 @@ argument_stack(char **parse, int count, void **esp)
   char *argv_each[count];
   int word_count;
 
-  /* Save the program name and arguments which in PARSE,
-     to ESP which mean esp register. */
+  /* word_count check how many word in file name. */
   word_count = 0;
-  for(i = count - 1 ; i > -1 ; i--)
-    {
-      for(j = strlen(parse[i]) ; j > -1 ; j--)
-        {
-          *esp = *esp - 1;
-          **(char **)esp = parse[i][j];
-          word_count++;
-        }
-      argv_each[i] = *esp;
-    }
 
-  /* Esp register read 4bytes each, so put 0 to make 
-     arguments length to be multuple of 4. */
-  for (i = 0 ; i < (4 - word_count % 4)%4 ; i++)
+  /* Push file name in stack. */
+  for (i = count - 1 ; i > -1 ; i--)
+  {
+    for (j = strlen(parse[i]) ; j > -1 ; j--)
     {
       *esp = *esp - 1;
-      **(uint8_t **)esp = 0;
+      **(char **)esp = parse[i][j];
+      word_count++;
     }
+    /* Save each start point of argv into array. */
+    argv_each[i] = *esp;
+  }
 
-  /* Put ARGV[COUNT], exactly ARGV array don't have
-     ARGV[COUNT], instead that put 0 and we will
-     treat that is value of ARGV[COUNT]. */
+  /* Align pointer to be multiple of 4 */
+  for (i = 0 ; i < (4 - word_count % 4) % 4 ; i++)
+  {
+    *esp = *esp - 1;
+    **(uint8_t **)esp = 0;
+  }
+  
+  /* Last argv is always null. */
   *esp = *esp - 4;
   **(char ***)esp = 0;
 
-  /* Put pointer of arguments to esp register. */
-  for(i = count - 1 ; i > -1 ; i--)
-    {
-      *esp = *esp - 4;
-      **(char ***)esp = argv_each[i];
-    }
+  /* Put argv[0] to argv[count - 1] */
+  for (i = count - 1 ; i > -1 ; i--)
+  {
+    *esp = *esp - 4;
+    **(char ***)esp = argv_each[i];
+  }
 
-  /* Put pointer of ARGV which mean the argument array
-     of user program's main funtion. */
+  /* Save current stack top pointer which is argv. */
   argv = *esp;
   *esp = *esp - 4;
   **(char ***)esp = argv;
 
-  /* Put argc to esp register. COUNT mean argc which
-     number of argument. */
-
+  /* argc is equal to count. */
   *esp = *esp - 4;
   **(int **)esp = count;
 
-  /* Push return address of user program. In this case,
-     put 0 which mean fake addres. */
+  /* Put fake address. */
   *esp = *esp - 4;
   **(char ***)esp = 0;
 }
 
+/* Get child process by using pid.
+   Compare pid with all process in child process list. */
 struct thread *
 get_child_process (int pid)
 {
   struct list_elem *e;
   struct list *child_list;
   struct thread *cp;
-  /* Search the CHILD_LIST to find the thread pointer
-     given PID. If fail, return NULL. */
+
+  /* Get current process's child process list and compare with pid. */
   child_list = &thread_current ()->child_process;
-  for (e = list_begin (child_list); e != list_end (child_list);
-       e = list_next (e))
-    {
-      cp = list_entry (e, struct thread, childelem);
-      if (cp->tid == pid)
-        return cp;
-    }
+  for (e = list_begin (child_list); e != list_end (child_list); e = list_next (e))
+  {
+    cp = list_entry (e, struct thread, childelem);
+    if (cp->tid == pid)
+      return cp;
+  }
+  /* If no correspond child process, return NULL. */
   return NULL;
 }
 
+/* Remove given child process. */
 void
 remove_child_process (struct thread *cp)
 {
-  /* Remove this process from CHILD_LIST, and deallocate. */
-  if(cp!=NULL)
-    {
-      list_remove (&cp->childelem);
-      palloc_free_page (cp);
-    }
+  /* If given child process is invalid, return. */
+  if (cp == NULL)
+    return;
+
+  /* remove child process from parent process's child list, and free. */
+  list_remove (&cp->childelem);
+  palloc_free_page (cp);
 }
 
+/* Put file into file descriptor table and change next position of addition. */
 int
 process_add_file (struct file *f)
-{ 
-  /* Add this file to file descriptor table. NEXT_FD indicates
-     the proper location in file descriptor table.
-     After insert increase the NEXT_FD of current thread,
-     and return the index which file is saved. */
+{
+  /* Next position for addition. */ 
   int next_fd;
-  next_fd=thread_current()->next_fd;
+
+  /* Put file into file descriptor table. */
+  next_fd = thread_current ()->next_fd;
   thread_current ()->fdt[next_fd] = f;
+
+  /* Point next empty space in file descriptor table. */
   thread_current ()->next_fd += 1;
+
+  /* Return where file is. */
   return next_fd;
 }
 
+/* Get file from file descriptor table.
+   If there is no file in corresponding position, return NULL */
 struct file *
 process_get_file (int fd)
 {
-  /* Return the point of file that given FD, file descripter.
-     The FD value is not proper, return NULL. */
-  if(fd>=thread_current()->next_fd)
+  /* If fd is invalid, return NULL. */
+  if (fd >= thread_current ()->next_fd)
     return NULL;
+  /* If fd is valid, return file in file descriptor table. */
   return thread_current ()->fdt[fd];
 }
 
+/* Close corresponding file in file descriptor table.
+   After that, initialize corresponding entry. */
 void
 process_close_file (int fd)
 {
-  /* Close the file given FD using file_close().
-     And then set that loacation to NULL. */
-  struct file *del_file=process_get_file (fd);
-  if(del_file!=NULL)
-    {  
-      file_close(del_file);
-      thread_current ()->fdt[fd] = NULL;
+  struct file *del_file;
+
+  /* Get file from file descriptor table using fd. */
+  del_file = process_get_file (fd);
+
+  /* If there is no file, return. */
+  if (del_file == NULL)
+    return;
+
+  /* Close file and initialize corresponding entry. */
+  file_close(del_file);
+  thread_current ()->fdt[fd] = NULL;
+}
+
+bool
+handle_mm_fault (struct vm_entry *vme)
+{
+  struct page *kpage;
+  bool load;
+
+  /* Allocate page using alloc_page. */
+  kpage = alloc_page (PAL_USER);
+
+  /* If physical page is already loaded return false. */
+  if (vme->is_loaded)
+    {
+      free_page(kpage->kaddr);
+      return false;
     }
+  if (kpage->kaddr == NULL)
+    return false;
+  
+  /* If type of VME is VM_BIN or VM_FILE load physical
+     page using load_file(). Or VM_ANON do swapping to
+     get page information from swap block location. */
+  switch (vme->type)
+    {
+      case VM_BIN:
+        load = load_file (kpage->kaddr, vme);
+        if (load == false)
+          {
+            free_page (kpage->kaddr);
+            return false;
+          }
+        break;
+      case VM_FILE:
+        load = load_file (kpage->kaddr, vme);
+        if (load == false)
+          {
+            free_page (kpage->kaddr);
+            return false;
+          }
+        break;
+      case VM_ANON:
+        swap_in (vme->swap_slot, kpage->kaddr);
+        break;
+      default:
+        return false;
+    }
+  /* Mapping physical page and virtual page. */
+  load = install_page (vme->vaddr, kpage->kaddr, vme->writable);
+  if (load == false)
+    {
+      free_page (kpage->kaddr);
+      return false;
+    }
+  /* Set IS_LOADED to true because physical page is
+     successfully loaded. */
+  vme->is_loaded = true;
+  
+  /* Set physical page's virtual page to VME. */
+  kpage->vme = vme;
+  return true;
+}
+
+bool
+expand_stack(void *addr)
+{
+  struct vm_entry *vme;
+  struct page *page;
+  /* If stack size over 8MB fail. */
+  if(addr < PHYS_BASE - 8 * 1048576)
+    return false;
+
+  /* Make vm_entry and insert to hash table. */
+  vme = (struct vm_entry *)malloc(sizeof(struct vm_entry));
+  vme->vaddr = pg_round_down(addr);
+  vme->writable = true;
+  vme->is_loaded = true;
+  vme->type = VM_ANON;
+  vme->pinned = true;
+  /* Allocate page and mapping physical page.  */
+  page = alloc_page(PAL_USER);
+  if(page == NULL)
+    {
+      free(vme);
+      return false;
+    }
+  page->vme=vme;
+  if(install_page(vme->vaddr,page->kaddr,vme->writable) == false)
+    {
+      free_page(page);
+      free(vme);
+      return false;
+    }
+  if(!insert_vme (&thread_current ()->vm, vme))
+    {
+      free_page(page);
+      free(vme);
+      return false;
+    }
+  return true;
 }

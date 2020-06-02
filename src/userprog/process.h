@@ -2,6 +2,8 @@
 #define USERPROG_PROCESS_H
 
 #include "threads/thread.h"
+#include "vm/page.h"
+#define CLOSE_ALL 0
 
 tid_t process_execute (const char *file_name);
 int process_wait (tid_t);
@@ -16,4 +18,6 @@ void remove_child_process (struct thread *cp);
 int process_add_file (struct file *f);
 void process_close_file (int fd);
 
+bool handle_mm_fault (struct vm_entry *vme);
+bool expand_stack(void *addr);
 #endif /* userprog/process.h */
